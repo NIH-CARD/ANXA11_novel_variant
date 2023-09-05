@@ -1,0 +1,971 @@
+# script to perform pseudo-bulk DGA
+# setwd("~/Desktop/demo/single_cell_DEG")
+
+---
+title: pseudobulk analysis
+output:
+    html_document:
+        code_folding: hide
+        toc: true
+        toc_float: true
+        toc_depth: 3
+---
+
+```{r setup}
+library(Seurat)
+library(DESeq2)
+library(tidyverse)
+library(future)
+library(dplyr)
+library(HGNChelper)
+library(openxlsx)
+library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(data.table)
+```
+
+```{r multiprocess_setup}
+# change the current plan to access parallelization
+#plan("multisession", workers = 2)
+plan("multicore")
+options(future.globals.maxSize = 8000 * 1024^2)
+plan()
+```
+
+```{r test, eval=FALSE}
+# get data
+# From this stuff we can see that previous clustering is critical
+eh <- ExperimentHub()
+query(eh, "Kang")
+
+sce <- eh[["EH2259"]]
+seu.obj <- as.Seurat(sce, data = NULL)
+```
+
+```{r get_data, cache=TRUE, eval=FALSE}
+# get data
+base_dir <- "/data/CARD_singlecell/ANXA11_AS/220201_A00941_0768_AHTTVTDRXY/220201_A00941_0768_AHTTVTDRXY/Data/Chromium_20220525/"
+,
+create_obj <- function(base_dir, folder) {
+    # base_dir_full <- paste0(base_dir, folder, '/outs/raw_feature_bc_matrix')
+    base_dir_full <- paste0(base_dir, folder, '/outs/filtered_feature_bc_matrix')
+    expression_matrix <- Read10X(data.dir = base_dir_full)
+    seu.obj <- CreateSeuratObject(counts = expression_matrix,
+                                project = folder,
+                                min.features = 100
+    )
+    assign(folder, seu.obj)
+
+    return(seu.obj)
+}
+# A70 empty vector (not really necessary, but can double
+# check if differences between wild type if it doesn't
+# take too long
+obj_1_a70 <- create_obj(base_dir, "1_a70")
+obj_5_a70 <- create_obj(base_dir, "5_a70")
+obj_9_a70 <- create_obj(base_dir, "9_a70")
+obj_13_a70 <- create_obj(base_dir, "13_a70")
+
+
+# P93 variant of unknown sig
+obj_4_p93 <- create_obj(base_dir, "4_p93")
+obj_8_p93 <- create_obj(base_dir, "8_p93")
+obj_12_p93 <- create_obj(base_dir, "12_p93")
+obj_16_p93 <- create_obj(base_dir, "16_p93")
+
+# i40 ANXA11 WT compare all samples to this
+obj_2_i40 <- create_obj(base_dir, "2_i40")
+obj_6_i40 <- create_obj(base_dir, "6_i40")
+obj_10_i40 <- create_obj(base_dir, "10_i40")
+obj_14_i40 <- create_obj(base_dir, "14_i40")
+
+# i42 ANXA11 R235Q
+obj_3_i42 <- create_obj(base_dir, "3_i42")
+obj_7_i42 <- create_obj(base_dir, "7_i42")
+obj_11_i42 <- create_obj(base_dir, "11_i42")
+obj_15_i42 <- create_obj(base_dir, "15_i42")
+
+merged_seurat <- merge(x = obj_2_i40,
+                       y = c(obj_6_i40, obj_10_i40, obj_14_i40,
+                             obj_3_i42, obj_7_i42, obj_11_i42, obj_15_i42, 
+                             obj_1_a70, obj_5_a70, obj_9_a70, obj_13_a70, 
+                             obj_4_p93, obj_8_p93, obj_12_p93, obj_16_p93),
+                       add.cell.id = c("wt_1", "wt_2", "wt_3", "wt_4",
+                                      "42_1", "42_2", "42_3", "42_4",
+                                      "em_1", "em_2", "em_3", "em_4",
+                                      "p93_1", "p93_2", "p93_3", "p93_4"
+                                      )
+                       )
+
+
+
+```
+
+
+# QC and filtering
+# explore QC
+
+```{r other, results='asis', eval=FALSE}
+# novelty score
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+
+merged_seurat[["percent.mt"]] <- PercentageFeatureSet(merged_seurat, pattern = "^MT-")
+
+# Compute percent mito ratio
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^MT-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+#View(seu.obj@meta.data)
+
+# Create metadata dataframe
+metadata <- merged_seurat@meta.data
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+pdf("qc.pdf") 
+VlnPlot(merged_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+dev.off()
+pdf("qc2.pdf") 
+VlnPlot(merged_seurat, features = c("log10GenesPerUMI","mitoRatio", "percent.mt"), ncol = 3)
+dev.off()
+# Create sample column
+metadata$condition <- NA
+metadata$condition[which(str_detect(metadata$cells, "^wt_"))] <- "wt"
+metadata$condition[which(str_detect(metadata$cells, "^42_"))] <- "42"
+metadata$condition[which(str_detect(metadata$cells, "^em_"))] <- "em"
+metadata$condition[which(str_detect(metadata$cells, "^p93_"))] <- "p93"
+
+metadata$condition <- NA
+metadata$condition[which(str_detect(metadata$cells, "^wt_"))] <- "wt"
+metadata$condition[which(str_detect(metadata$cells, "^42_"))] <- "42"
+metadata$condition[which(str_detect(metadata$cells, "^em_"))] <- "em"
+metadata$condition[which(str_detect(metadata$cells, "^p93_"))] <- "p93"
+
+
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(seq_folder = orig.ident,
+                      nUMI = nCount_RNA,
+                      nGene = nFeature_RNA)
+
+# Add metadata back to Seurat object
+merged_seurat@meta.data <- metadata
+# Create .RData object to load at any time
+#save(merged_seurat, file="merged_filtered_seurat.RData")
+save(merged_seurat, file="merged_prefiltered_seurat.RData")
+```
+
+
+```{r filter, eval=TRUE}
+# filter
+# Filter out low quality cells using selected thresholds - these will change with experiment
+filtered_seurat <- subset(x = merged_seurat, 
+                         subset= (nUMI >= 800) & 
+                        (nGene <=6000) &
+                           (nGene >= 200) & 
+                           (log10GenesPerUMI > 0.80) & 
+                            (percent.mt < 10))
+
+# Create .RData object to load at any time
+save(filtered_seurat, file="seurat_filtered.RData")
+```
+
+
+```{r rest, eval=FALSE}
+load("seurat_filtered.RData")
+seu.filtered <- filtered_seurat
+
+# Get the batch to regress out for PCA
+metadata <- seu.filtered@meta.data
+metadata <- metadata %>% add_rownames() %>%
+            separate_wider_delim(cols=rowname,
+                                 names= c("type", "sample_num", "read"),
+                                 delim='_',
+                                 cols_remove=FALSE)
+
+metadata <- metadata %>%
+    mutate(batch = case_when(sample_num %in% c(1,2) ~ '1',
+                             sample_num %in% c(3,4) ~ '2')) %>%
+    column_to_rownames("rowname") %>%
+    as.data.frame()
+
+seu.filtered@meta.data <- metadata
+
+# run Seurat's standard workflow steps
+seu.filtered <- NormalizeData(seu.filtered)
+seu.filtered <- FindVariableFeatures(seu.filtered)
+seu.filtered <- ScaleData(seu.filtered)
+seu.filtered <- RunPCA(seu.filtered)
+pdf("ElbowPlot.pdf")
+ElbowPlot(seu.filtered, ndims=40)
+dev.off()
+seu.filtered <- FindNeighbors(seu.filtered, dims = 1:32)
+seu.filtered <- RunUMAP(seu.filtered, dims = 1:32)
+
+
+# This is okay for the eventual DESEq because the counts 
+# slot is ultimately used for that operation. These are the raw
+# counts
+#
+# algorithm equals for 4 for leiden algorithm
+seurat_clustered <- FindClusters(seu.filtered, 
+                                 resolution = c(0.2),
+                                 method="igraph",
+                                algorithm=1)
+
+seu.filtered <- seurat_clustered
+pdf("cluster_plot_batch.pdf")
+# show the batch effect on the clustering
+DimPlot(seurat_clustered, reduction="umap", group.by="batch", raster=TRUE, raster.dpi=c(600,600))
+dev.off()
+
+
+# Try integration #not really necessary
+
+## split the dataset into a list of two seurat objects (stim and CTRL)
+#seurat_clustered.list <- SplitObject(seurat_clustered, split.by = "batch")
+#
+## normalize and identify variable features for each dataset independently
+#seurat_clustered.list <- lapply(X = seurat_clustered.list, FUN = function(x) {
+#    x <- NormalizeData(x)
+#    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+#})
+#
+## select features that are repeatedly variable across datasets for integration
+#features <- SelectIntegrationFeatures(object.list = seurat_clustered.list)
+#
+#saveRDS(seurat_clustered, "seurat_clustered")
+#seurat_clustered <- readRDS("seurat_clustered")
+#
+#cell.anchors <- FindIntegrationAnchors(object.list = seurat_clustered.list, anchor.features = features)
+#
+## this command creates an 'integrated' data assay
+#cell.combined <- IntegrateData(anchorset = cell.anchors)
+#
+## specify that we will perform downstream analysis on the corrected data note that the
+## original unmodified data still resides in the 'RNA' assay
+#DefaultAssay(cell.combined) <- "integrated"
+#
+## Run the standard workflow for visualization and clustering
+#cell.combined <- ScaleData(cell.combined, verbose = FALSE)
+#cell.combined <- RunPCA(cell.combined, npcs = 30, verbose = FALSE)
+#cell.combined <- RunUMAP(cell.combined, reduction = "pca", dims = 1:32)
+#cell.combined <- FindNeighbors(cell.combined, reduction = "pca", dims = 1:32)
+#cell.combined <- FindClusters(cell.combined, resolution = 0.2)
+#
+
+DefaultAssay(cell.combined) <- "RNA"
+
+# cluster
+neurons <- c("MAP2", "TUBB3", "NEFL", "GRIN2B", "DCX", "SLC17A6", "SLC17A7")
+microglia <- c("AIF1", "FTL", "FTH1", "TREM2", "CX3CR1", "SLC2A5", "P2RY12", "ITGAM")
+
+pdf("FeaturPlot_neurons.pdf")
+FeaturePlot(seurat_clustered, neurons)
+dev.off()
+
+pdf("FeatuePlot_microglia.pdf")
+FeaturePlot(seurat_clustered, microglia)
+dev.off()
+
+pdf("FeaturePlot_Xylena.pdf")
+FeaturePlot(seurat_clustered, c("APOE", "DCX", "S100B", "AIF1", "TUBB3", "PHOX2B"))
+dev.off()
+
+new.cluster.ids <- c("Neurons", "Neurons", "Microglia", "Neurons", "Microglia", "Undertermined", "PHOX2B+ Neurons", "Undetermined", "Undetermined")
+names(new.cluster.ids) <- levels(seurat_clustered)
+seurat_clustered <- RenameIdents(seurat_clustered, new.cluster.ids)
+seurat_clustered
+
+pdf("Dimplot.pdf")
+DimPlot(seurat_clustered, reduction='umap')
+dev.off()
+
+
+DefaultAssay(seurat_clustered)
+
+# If you owuld like to start from just the prefiltered data
+save.image('full_cluster_naming.RData')
+```
+
+```{r pseudobulk, results='asis', eval=TRUE}
+# seurat_clustered <- load("merged_prefiltered_seurat.RData")
+
+# KEep onlu certain cell types
+load('full_cluster_naming.RData')
+neuron_types_to_track <- c('Microglia', 'Neurons')
+seurat_clustered_sel <- subset(x = seurat_clustered, idents = neuron_types_to_track)
+
+samples_split <- strsplit(as.character(seurat_clustered_sel$cells), "_")
+samples <- c()
+samples <- lapply(samples_split, (function(i) i[2]))
+
+# Put in ident columns
+seurat_clustered_sel@meta.data$cell_class <- Idents(seurat_clustered_sel)
+
+# Be careful about performin these. Check if already part of the object
+#if(!("sample_num" %in% colnames(seurat_clustered_sel@meta.data))){
+    seurat_clustered_sel@meta.data$sample <- paste0(seurat_clustered_sel$condition, seurat_clustered_sel$sample_num)
+#}
+
+
+# Group by cell type (e.g. Radial Glia) and sample name. 
+# Sample name format  p9344 e.g.
+
+# This is okay for the eventual DESEq because the counts 
+# slot is ultimately used for that operation. These are the raw
+# counts
+cts <- AggregateExpression(seurat_clustered_sel, 
+                    group.by = c("cell_class", "sample"),
+                    assays = 'RNA',
+                    slot = "counts",
+                    return.seurat = FALSE)
+
+# Matrix counts genes x celltype_conditionSampleNum
+cts_rna <- cts$RNA
+
+# transpose
+# celltype_conditonSampleNum X genes
+cts_rna.t <- t(cts_rna)
+
+
+# convert to data.frame
+cts_rna.t <- as.data.frame(cts_rna.t)
+
+# get values where to split
+splitRows <- gsub('_.*', '', rownames(cts_rna.t))
+
+
+# split data.frame
+cts.split <- split.data.frame(cts_rna.t,
+                 f = factor(splitRows))
+
+# fix colnames and transpose
+
+cts.split.modified <- lapply(cts.split, function(x){
+  rownames(x) <- gsub('.*_(.*)', '\\1', rownames(x))
+  t(x)
+  
+})
+
+#gsub('.*_(.*)', '\\1', 'B cells_ctrl101')
+
+# Make colData with condition and neuron type
+colData <- data.frame(samples = colnames(cts_rna))
+rownames(colData) <- NULL # prevents an error
+
+colData <- colData %>%
+  mutate(condition = case_when(grepl('42',  samples) ~ 'ANXA11_R235Q', 
+                   grepl('em',  samples) ~ 'empty',
+                   grepl('p93', samples) ~ 'ANXA11_P93S',
+                   grepl('wt',  samples) ~ 'ANXA11_WT')) %>%
+  mutate(type = tstrsplit(samples, '_')[[1]]) %>%
+  column_to_rownames(var = 'samples')
+colData$sample_num <- str_sub(rownames(colData),-1,-1)
+
+colData <- colData %>%
+    mutate(batch = case_when(sample_num %in% c(1,2) ~ '1',
+                             sample_num %in% c(3,4) ~ '2'))
+
+# Create a separate dds object for the visualization
+dds <- DESeqDataSetFromMatrix(countData = cts_rna,
+                              colData = colData,
+                              design = ~ condition + batch)
+# no longer need empty vector
+dds <- dds[, dds$condition != 'empty']
+dds$condition <- droplevels(dds$condition)
+
+# Change sample names
+colnames(dds) <- colnames(dds) %>% str_replace('wt', 'ANXA11_WT_')
+colnames(dds) <- colnames(dds) %>% str_replace('42', 'ANXA11_R235Q_')
+colnames(dds) <- colnames(dds) %>% str_replace('93', 'ANXA11_P93S_')
+
+vsd <- vst(dds, blind = TRUE)
+mat <- plotPCA(vsd, intgroup=c("condition", "batch"), returnData=TRUE)
+pv <- attr(mat, 'percentVar')
+p <- ggplot2::ggplot(data=mat, aes_string(x='PC1', y='PC2', color='condition', label='name')) +
+          geom_point(size=3) + xlab(paste0('PC1: ', round(pv[1]*100), '% variance')) +
+          ylab(paste0('PC2: ', round(pv[2]*100), '% variance')) + coord_fixed()
+p
+ggsave("PCA_all.pdf")
+
+genes <- c("ACTL6B", "ACTR1A", "ADARB2", "ADCY1", "ADCY8", "AKT3", "ATG4B", "BCKDHB", "C20orf194", "CAMK2B", "CBARP", "CDH4", "CDK7", "CDO1", "CELF5", "CENPBD1P1", "CEP290", "CHID1", "CORO7", "CYFIP2", "DLGAP1", "DNAJC12", "ELAPOR1", "ELAVL3", "ETS2", "ETV5", "FBN3", "FEZ1", "GRAMD1A", "HDGFL2", "ICA1", "IGLON5", "IGSF21", "INSR", "ISL2", "ITGA3", "ITGA7", "KALRN", "KCNIP1", "KIAA0753", "KIF17", "KIF21A", "KNDC1", "LIN28B", "MADD", "MAST1", "MNAT1", "MTSS2", "MYO1C", "NECAB2", "NPEPL1", "NPLOC4", "NSMCE4A", "NUP188", "NUP210", "NYNRIN", "PAOX", "PFKP", "PHF12", "PHF2", "PRELID3A", "PRKG2", "PTPRN2", "PTPRT", "PXDN", "RIN2", "RNFT2", "SEMA6D", "SEPTIN11", "SHQ1", "SLC24A3", "SLC26A11", "STMN2", "STXBP5L", "SYT7", "TMEM117", "TRAPPC12", "UBASH3B", "UNC13A", "UNC13B", "USP10", "USP13", "UVRAG", "WASL", "WDR35", "XPO4", "ZNF826P")
+
+genes_in_data <- rownames(assay(vsd))
+shared_genes <- intersect(genes_in_data, genes)
+
+# BAsed on https://support.bioconductor.org/p/133313/
+v <- assay(vsd)
+v <- as.data.frame(v)
+vst_sig <- v[shared_genes,]
+heat <- t(scale(t(vst_sig)))
+
+cols_for_group <- c('type', 'condition', 'batch')
+cold <- vsd@colData[cols_for_group]
+assay(dds) <- limma::removeBatchEffect(assay(dds), dds$batch)
+assay(vsd) <- limma::removeBatchEffect(assay(vsd), vsd$batch)
+
+# Expression heatmaps
+samples <- scale(t(assay(vsd)))
+sampleMatrix <- as.matrix(samples)
+rownames(sampleMatrix) <- colnames(vsd)
+df <- as.data.frame(colData(vsd)[, cols_for_group])
+colnames(df) <- cols_for_group
+rownames(df) <- colnames(vsd)
+sampleMatrix <- sampleMatrix[,shared_genes]
+heatmaply::heatmaply(sampleMatrix,
+          scale='none',
+          col=colors,
+          row_side_colors=df,
+          file = 'scaled_gene_expression.html',
+          fontsize_col = 8,
+          showticklabels=c(FALSE,TRUE))
+
+samples <- scale(t(assay(dds)))
+sampleMatrix <- as.matrix(samples)
+rownames(sampleMatrix) <- colnames(dds)
+colors <- colorRampPalette(RColorBrewer::brewer.pal(9, 'RdBu'))(255)
+df <- as.data.frame(colData(dds)[, cols_for_group])
+colnames(df) <- cols_for_group
+rownames(df) <- colnames(dds)
+sampleMatrix <- sampleMatrix[,shared_genes]
+heatmaply::heatmaply(sampleMatrix,
+          scale='none',
+          col=colors,
+          row_side_colors=df,
+          file = 'batch_corrected_gene_expression.html',
+          fontsize_col=8,
+          showticklabels=c(FALSE,TRUE))
+
+# Try this kind of normalization because
+dds <- DESeqDataSetFromMatrix(countData = cts_rna,
+                              colData = colData,
+                              design = ~ condition + batch)
+# no longer need empty vector
+dds <- dds[, dds$condition != 'empty']
+dds$condition <- droplevels(dds$condition)
+
+# Change sample names
+colnames(dds) <- colnames(dds) %>% str_replace('wt', 'ANXA11_WT_')
+colnames(dds) <- colnames(dds) %>% str_replace('42', 'ANXA11_R235Q_')
+colnames(dds) <- colnames(dds) %>% str_replace('93', 'ANXA11_P93S_')
+
+dds <- estimateSizeFactors(dds)
+samples <- counts(dds, normalized=FALSE)[shared_genes,]
+samples <- limma::removeBatchEffect(samples, dds$batch)
+#samples <- t(apply(samples, 1, scale))
+sampleMatrix <- as.matrix(samples)
+colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'RdBu')))(255)
+df <- as.data.frame(colData(dds)[, cols_for_group])
+colnames(df) <- cols_for_group
+rownames(df) <- colnames(dds)
+heatmaply::heatmaply(t(sampleMatrix),
+          scale='none',
+          col=colors,
+          row_side_colors=df,
+          file = 'median_non_normalzied_corrected_gene_expression.html',
+          fontsize_col=8,
+          showticklabels=c(FALSE,TRUE))
+
+# Just using rlog dealt with sample variability of low counts
+dds <- DESeqDataSetFromMatrix(countData = cts_rna,
+                              colData = colData,
+                              design = ~ condition + batch)
+# no longer need empty vector
+dds <- dds[, dds$condition != 'empty']
+dds$condition <- droplevels(dds$condition)
+
+# Change sample names
+colnames(dds) <- colnames(dds) %>% str_replace('wt', 'ANXA11_WT_')
+colnames(dds) <- colnames(dds) %>% str_replace('42', 'ANXA11_R235Q_')
+colnames(dds) <- colnames(dds) %>% str_replace('93', 'ANXA11_P93S_')
+
+dds <- estimateSizeFactors(dds)
+samples <- counts(dds, normalized=TRUE)[shared_genes,]
+nm <- model.matrix(~type + condition, colData(dds))
+samples <- limma::removeBatchEffect(samples, dds$batch)
+samples <- as.matrix(samples)
+sampleMatrix <- t(apply(samples, 1, scale))
+colnames(sampleMatrix) <- colnames(samples)
+colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'RdBu')))(255)
+df <- as.data.frame(colData(dds)[, cols_for_group])
+colnames(df) <- cols_for_group
+rownames(df) <- colnames(dds)
+heatmaply::heatmaply(t(sampleMatrix),
+          scale='none',
+          col=colors,
+          row_side_colors=df,
+          file = 'median_normalzied_corrected_gene_expression.html',
+          fontsize_col=8,
+          showticklabels=c(TRUE,TRUE))
+
+
+dds <- DESeqDataSetFromMatrix(countData = cts_rna,
+                   colData = colData,
+                   design = ~ batch + condition)
+# no longer need empty vector
+dds <- dds[, dds$condition != 'empty']
+dds$condition <- droplevels(dds$condition)
+
+# Change sample names
+colnames(dds) <- colnames(dds) %>% str_replace('wt', 'ANXA11_WT_')
+colnames(dds) <- colnames(dds) %>% str_replace('42', 'ANXA11_R235Q_')
+colnames(dds) <- colnames(dds) %>% str_replace('93', 'ANXA11_P93S_')
+
+rld <- rlog(dds, blind = FALSE)
+mat <- assay(rld)
+nm <- model.matrix(~type + condition, colData(rld))
+mat <- limma::removeBatchEffect(mat, batch=rld$batch, design=nm)
+assay(rld) <- mat
+cols_for_group <- c('condition', 'batch')
+samples <- assay(rld, normalized=TRUE)[shared_genes,]
+samples <- as.matrix(samples)
+# z-score
+sampleMatrix <- t(apply(samples, 1, scale))
+colnames(sampleMatrix) <- colnames(samples)
+colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'RdBu')))(255)
+df <- as.data.frame(colData(rld)[, cols_for_group])
+colnames(df) <- cols_for_group
+rownames(df) <- colnames(rld)
+heatmaply::heatmaply(t(sampleMatrix),
+        scale='none',
+        col=colors,
+        row_side_colors=df,
+        fontsize_col=8,
+        file = 'median_rld_normalzied_corrected_gene_expression.html',
+        showticklabels=c(TRUE,TRUE))
+
+# Now with just each individual neuron type
+
+heatmap_single_type   <- function(counts, type_c, shared_genes){  
+    print(type_c)
+    # 2. generate sample level metadata
+    colData <- data.frame(samples = colnames(counts))
+    
+    colData <- colData %>%
+    mutate(condition = case_when(grepl('42',  samples) ~ 'ANXA11_R235Q', 
+                   grepl('em',  samples) ~ 'empty',
+                   grepl('p93', samples) ~ 'ANXA11_P93S',
+                   grepl('wt',  samples) ~ 'ANXA11_WT')) %>%
+    column_to_rownames(var = 'samples') 
+    colData$sample_num <- str_sub(rownames(colData),-1,-1)
+    colData <- colData %>%
+        mutate(batch = case_when(sample_num %in% c(1,2) ~ '1',
+                                 sample_num %in% c(3,4) ~ '2'))
+    
+    
+    dds <- DESeqDataSetFromMatrix(countData = counts,
+                       colData = colData,
+                       design = ~ batch + condition)
+    # no longer need empty vector
+    dds <- dds[, dds$condition != 'empty']
+    dds$condition <- droplevels(dds$condition)
+    # Change sample names
+    colnames(dds) <- colnames(dds) %>% str_replace('wt', 'ANXA11_WT_')
+    colnames(dds) <- colnames(dds) %>% str_replace('42', 'ANXA11_R235Q_')
+    colnames(dds) <- colnames(dds) %>% str_replace('93', 'ANXA11_P93S_')
+    
+    cols_for_group <- c('condition', 'batch')
+    dds <- estimateSizeFactors(dds)
+    samples <- counts(dds, normalized=TRUE)[shared_genes,]
+    samples <- limma::removeBatchEffect(samples, dds$batch)
+    #samples <- t(apply(samples, 1, scale))
+    sampleMatrix <- as.matrix(samples)
+    colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'RdBu')))(255)
+    df <- as.data.frame(colData(dds)[, cols_for_group])
+    colnames(df) <- cols_for_group
+    rownames(df) <- colnames(dds)
+    heatmaply::heatmaply(t(sampleMatrix),
+              scale='none',
+              col=colors,
+              row_side_colors=df,
+              fontsize_col = 8,
+              file = paste0(type_c, '_median_non_normalzied_corrected_gex.html'),
+              showticklabels=c(TRUE,TRUE))
+    
+    # http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#why-after-vst-are-there-still-batches-in-the-pca-plot
+    # vst(blind = TRUE) means across-all-samples variability (Good for inital looking)
+    # vst(bline = FALSE) means within-samples variability
+    dds <- DESeqDataSetFromMatrix(countData = counts,
+                       colData = colData,
+                       design = ~ batch + condition)
+    # no longer need empty vector
+    dds <- dds[, dds$condition != 'empty']
+    dds$condition <- droplevels(dds$condition)
+
+    # Change sample names
+    colnames(dds) <- colnames(dds) %>% str_replace('wt', 'ANXA11_WT_')
+    colnames(dds) <- colnames(dds) %>% str_replace('42', 'ANXA11_R235Q_')
+    colnames(dds) <- colnames(dds) %>% str_replace('93', 'ANXA11_P93S_')
+    
+    rld <- rlog(dds, blind = FALSE)
+    mat <- assay(rld)
+    nm <- model.matrix(~condition, colData(rld))
+    mat <- limma::removeBatchEffect(mat, batch=rld$batch, design=nm)
+    assay(rld) <- mat
+    cols_for_group <- c('condition', 'batch')
+    samples <- assay(rld, normalized=TRUE)[shared_genes,]
+    samples <- as.matrix(samples)
+    # z-score
+    sampleMatrix <- t(apply(samples, 1, scale))
+    colnames(sampleMatrix) <- colnames(samples)
+    colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'RdBu')))(255)
+    df <- as.data.frame(colData(rld)[, cols_for_group])
+    colnames(df) <- cols_for_group
+    rownames(df) <- colnames(rld)
+
+    filename <- paste0(type_c, '_median_normalzied_corrected_gex.html')
+    heatmaply::heatmaply(t(sampleMatrix),
+              scale='none',
+              col=colors,
+              row_side_colors=df,
+              file=filename,
+              fontsize_col = 8,
+              showticklabels=c(TRUE,TRUE))
+}  
+
+counts <- cts.split.modified[['Microglia']]
+heatmap_single_type(counts, 'Microglia', shared_genes)
+counts <- cts.split.modified[['Neurons']]
+heatmap_single_type(counts, 'Neurons', shared_genes)
+
+```
+
+
+```{r deseq2, results='asis', cache=TRUE}
+# perform DESeq2 --------
+# Create DESeq2 object   
+# 1. Get counts matrix
+library(foreach)
+# MAke sure in a chunk with asis
+mdcat <- function(...){
+  cat('\n\n', ..., ' \n\n', sep='', fill=1500)
+}
+
+
+plot_volcano_label <- function(res,
+                         fdr_thres=0.1,
+                         fd_thres=0,
+                         fc_lim=NULL,
+                         genes_to_label=NULL,
+                         label_column=NULL
+                         ){
+  # TODO: Add ggrastr option for points
+  genes_to_label <- as.character(genes_to_label)
+  nna <- sum(is.na(genes_to_label))
+  if (nna > 0){
+      warning(paste("Removing", nna, "NAs from gene list"))
+                 abs(res$log2FoldChange) >= fd_thres,]
+  de.list <- data.frame(genes=rownames(de.list), de.list)
+
+  # get data frame of DE genes outside plot limits
+  up.max.de <- up.max[rownames(up.max) %in% rownames(de.list),]
+  down.max.de <- down.max[rownames(down.max) %in% rownames(de.list),]
+
+  # create ggplot with appropriate layers
+  p <- ggplot(res, aes(log2FoldChange, -log10(padj))) +
+    geom_point(col="gray40") + xlim(fc_lim[1], fc_lim[2]) +
+    theme_bw() + theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank())
+
+  p <- p + ggplot2::geom_point(data=up.max, col="gray40", pch=2)                 # add points above max y
+  p <- p + ggplot2::geom_point(data=down.max, col="gray40", pch=6)               # add points below min y
+
+  p <- p + ggplot2::geom_point(data=de.list, col="red")                          # add DE points
+  p <- p + ggplot2::geom_point(data=up.max.de, col="red", pch=2)                 # add DE points above max y
+  p <- p + ggplot2::geom_point(data=down.max.de, col="red", pch=6)               # add DE points below min y
+
+
+  if(!is.null(genes_to_label)){
+    # get data frame of genes to be labeled
+    if (!is.null(label_column)){
+        if (!(label_column %in% colnames(res))){
+            stop(paste(label_column, "is not a column in the results object; columns are:", colnames(res)))
+        }
+        res$gene.labels <- res[,label_column]
+    } else {
+        res$gene.labels <- rownames(res)
+    }
+
+    label.list <- res[res$gene.labels %in% genes_to_label,]
+    #label.list <- data.frame(genes=rownames(label.list), label.list)
+
+    # label genes outside limits
+    up.max.idx <- rownames(label.list) %in% rownames(up.max)
+    down.max.idx <- rownames(label.list) %in% rownames(down.max)
+
+    if(sum(up.max.idx) > 0){
+      label.list$log2FoldChange[up.max.idx] <- rep(fc_lim[2], sum(up.max.idx))
+    }
+
+    if(sum(down.max.idx) > 0){
+      label.list$log2FoldChange[down.max.idx] <- rep(fc_lim[1], sum(down.max.idx))
+    }
+
+    # add labels
+    p <- p + ggplot2::geom_point(data=label.list, col="black", pch=1, size=3)
+    p <- p + ggrepel::geom_label_repel(data=label.list, aes(label=label.list$gene.labels, fontface="italic"))
+  }
+  return(p)
+
+}
+
+plotMA_label <- function(res,
+                         fdr_thres=0.1,
+                         fd_thres=0,
+                         fc_lim=NULL,
+                         genes_to_label=NULL,
+                         label_column=NULL
+                         ){
+  # TODO: Add ggrastr option for points
+  genes_to_label <- as.character(genes_to_label)
+  nna <- sum(is.na(genes_to_label))
+  if (nna > 0){
+      warning(paste("Removing", nna, "NAs from gene list"))
+      genes_to_label <- genes_to_label[!is.na(genes_to_label)]
+  }
+  # convert res to data frame
+  res <- data.frame(res)
+
+  # if y limits not specified
+  if(is.null(fc_lim)){
+    fc_lim <- range(res$log2FoldChange, na.rm=TRUE)
+    fc_lim[1] <- floor(fc_lim[1])
+    fc_lim[2] <- ceiling(fc_lim[2])
+  }
+
+  # get data frame of genes outside plot limits
+  up.max <- res[res$log2FoldChange > fc_lim[2],]
+  up.max$log2FoldChange <- rep(fc_lim[2], dim(up.max)[1])
+  up.max <- data.frame(genes=rownames(up.max), up.max)
+
+  down.max <- res[res$log2FoldChange < fc_lim[1],]
+  down.max$log2FoldChange <- rep(fc_lim[1], dim(down.max)[1])
+  down.max <- data.frame(genes=rownames(down.max), down.max)
+
+  # get data frame of DE genes
+  de.list <- res[res$padj < fdr_thres &
+                 !is.na(res$padj) &
+                 abs(res$log2FoldChange) >= fd_thres,]
+  de.list <- data.frame(genes=rownames(de.list), de.list)
+
+  # get data frame of DE genes outside plot limits
+  up.max.de <- up.max[rownames(up.max) %in% rownames(de.list),]
+  down.max.de <- down.max[rownames(down.max) %in% rownames(de.list),]
+
+    fc_lim <- range(res$log2FoldChange, na.rm=TRUE)
+    fc_lim[1] <- floor(fc_lim[1])
+    fc_lim[2] <- ceiling(fc_lim[2])
+  }
+
+  # get data frame of genes outside plot limits
+  up.max <- res[res$log2FoldChange > fc_lim[2],]
+  up.max$log2FoldChange <- rep(fc_lim[2], dim(up.max)[1])
+  up.max <- data.frame(genes=rownames(up.max), up.max)
+
+  down.max <- res[res$log2FoldChange < fc_lim[1],]
+  down.max$log2FoldChange <- rep(fc_lim[1], dim(down.max)[1])
+  down.max <- data.frame(genes=rownames(down.max), down.max)
+
+  # get data frame of DE genes
+  de.list <- res[res$padj < fdr_thres &
+                 !is.na(res$padj) &
+                 abs(res$log2FoldChange) >= fd_thres,]
+  de.list <- data.frame(genes=rownames(de.list), de.list)
+
+  # get data frame of DE genes outside plot limits
+  up.max.de <- up.max[rownames(up.max) %in% rownames(de.list),]
+  down.max.de <- down.max[rownames(down.max) %in% rownames(de.list),]
+
+  # create ggplot with appropriate layers
+  p <- ggplot2::ggplot(res, aes(baseMean, log2FoldChange)) +
+    ggplot2::geom_point(col="gray40") + scale_x_log10() + ylim(fc_lim[1], fc_lim[2]) +
+    theme_bw() + theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank())
+
+  p <- p + ggplot2::geom_hline(yintercept = 0, col="red", size=2, alpha=0.5)     # add horizontal line
+  p <- p + ggplot2::geom_point(data=up.max, col="gray40", pch=2)                 # add points above max y
+  p <- p + ggplot2::geom_point(data=down.max, col="gray40", pch=6)               # add points below min y
+
+  p <- p + ggplot2::geom_point(data=de.list, col="red")                          # add DE points
+  p <- p + ggplot2::geom_point(data=up.max.de, col="red", pch=2)                 # add DE points above max y
+  p <- p + ggplot2::geom_point(data=down.max.de, col="red", pch=6)               # add DE points below min y
+
+
+  if(!is.null(genes_to_label)){
+    # get data frame of genes to be labeled
+    if (!is.null(label_column)){
+        res$gene.labels <- res[,label_column]
+    } else {
+        res$gene.labels <- rownames(res)
+    }
+
+    label.list <- res[res$gene.labels %in% genes_to_label,]
+    #label.list <- data.frame(genes=rownames(label.list), label.list)
+
+    # label genes outside limits
+    up.max.idx <- rownames(label.list) %in% rownames(up.max)
+    down.max.idx <- rownames(label.list) %in% rownames(down.max)
+
+    if(sum(up.max.idx) > 0){
+      label.list$log2FoldChange[up.max.idx] <- rep(fc_lim[2], sum(up.max.idx))
+    }
+
+    if(sum(down.max.idx) > 0){
+      label.list$log2FoldChange[down.max.idx] <- rep(fc_lim[1], sum(down.max.idx))
+    }
+
+    # add labels
+    p <- p + ggplot2::geom_point(data=label.list, col="black", pch=1, size=3)
+    p <- p + ggrepel::geom_label_repel(data=label.list, aes(label=label.list$gene.labels, fontface="italic"))
+  }
+  return(p)
+
+}
+
+get_dds_list <- function(neuron_type){
+    counts <- cts.split.modified[[neuron_type]]
+
+
+    # 2. generate sample level metadata
+    colData <- data.frame(samples = colnames(counts))
+
+    colData <- colData %>%
+    mutate(condition = case_when(grepl('42',  samples) ~ '42', 
+                   grepl('em',  samples) ~ 'empty',
+                   grepl('p93', samples) ~ 'p93',
+                   grepl('wt',  samples) ~ 'wt')) %>%
+    column_to_rownames(var = 'samples') 
+    colData$sample_num <- str_sub(rownames(colData),-1,-1)
+    colData <- colData %>%
+        mutate(batch = case_when(sample_num %in% c(1,2) ~ '1',
+                                 sample_num %in% c(3,4) ~ '2'))
+
+
+    dds <- DESeqDataSetFromMatrix(countData = counts,
+                       colData = colData,
+                       design = ~ batch + condition)
+
+
+    # Check the coefficients for the comparison
+    resultsNames(dds)
+    results_list <- c()
+    #untreated comes last. represents log2(treated/untreated)
+    p93_vs_wt <- lfcShrink(dds, contrast=c("condition", "p93", "wt"), type='ashr')
+    write.csv(p93_vs_wt,paste0("output/",neuron_type,"_p93_vs_wt",".csv"),row.names=TRUE)
+    genes_to <- rownames(head(arrange(as.data.frame(p93_vs_wt), padj, desc(log2FoldChange)),n=10))
+    plotMA_label(p93_vs_wt, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_p93_vs_wt_MA",".pdf"),dpi=500)
+    plot_volcano_label(p93_vs_wt, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_p93_vs_wt_volcano",".pdf"), dpi=500)
+    
+    v42_vs_wt <- lfcShrink(dds, contrast=c("condition", "42", "wt"), type='ashr')
+    write.csv(v42_vs_wt,paste0("output/",neuron_type,"_v42_vs_wt",".csv"),row.names=TRUE)
+    genes_to <- rownames(head(arrange(as.data.frame(v42_vs_wt), padj, desc(log2FoldChange)),n=10))
+    plotMA_label(v42_vs_wt, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_v42_vs_wt_MA",".pdf"))
+    plot_volcano_label(v42_vs_wt, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_v42_vs_wt_volcano",".pdf"))
+    
+    empty_vs_wt <- lfcShrink(dds, contrast=c("condition", "empty", "wt"), type='ashr')
+    write.csv(empty_vs_wt,paste0("output/",neuron_type,"_empty_vs_wt",".csv"),row.names=TRUE)
+    genes_to <- rownames(head(arrange(as.data.frame(empty_vs_wt), padj, desc(log2FoldChange)),n=10))
+    plotMA_label(empty_vs_wt, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_empty_vs_wt_MA",".pdf"))
+    plot_volcano_label(empty_vs_wt, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_empty_vs_wt_volcano",".pdf"))
+    
+    p93_vs_empty <- lfcShrink(dds, contrast=c("condition", "p93", "empty"), type='ashr')
+    write.csv(p93_vs_empty,paste0("output/",neuron_type,"_p93_vs_empty",".csv"),row.names=TRUE)
+    genes_to <- rownames(head(arrange(as.data.frame(p93_vs_empty), padj, desc(log2FoldChange)),n=10))
+    plotMA_label(p93_vs_empty, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_p93_vs_empty_MA",".pdf"))
+    plot_volcano_label(p93_vs_empty, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_p93_vs_empty_volcano",".pdf"))
+    
+    v42_vs_empty <- lfcShrink(dds, contrast=c("condition", "42", "empty"), type='ashr')
+    write.csv(v42_vs_empty,paste0("output/",neuron_type,"_v42_vs_empty",".csv"),row.names=TRUE)
+    genes_to <- rownames(head(arrange(as.data.frame(v42_vs_empty), padj, desc(log2FoldChange)),n=10))
+    plotMA_label(v42_vs_empty, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_v42_vs_empty_MA",".pdf"))
+    plot_volcano_label(v42_vs_empty, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_v42_vs_empty_volcano",".pdf"))
+    
+    p93_vs_42 <- lfcShrink(dds, contrast=c("condition", "p93", "42"), type='ashr')
+    write.csv(p93_vs_42,paste0("output/",neuron_type,"_p93_vs_42",".csv"),row.names=TRUE)
+    genes_to <- rownames(head(arrange(as.data.frame(p93_vs_42), padj, desc(log2FoldChange)),n=10))
+    plotMA_label(p93_vs_42, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_p93_vs_42_MA",".pdf"))
+    plot_volcano_label(p93_vs_42, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_p93_vs_42_volcano",".pdf"))
+
+    results_list <- c(p93_vs_wt, v42_vs_wt, empty_vs_wt, p93_vs_empty, v42_vs_empty, p93_vs_42)
+    
+    return(results_list)
+
+}
+```
+
+```{r run_foreach}
+dds_list <- foreach(neuron_type = neuron_types_to_track) %dopar%{
+ 
+    get_dds_list(neuron_type)
+}
+
+    plot_volcano_label(v42_vs_empty, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_v42_vs_empty_volcano",".pdf"))
+    
+    p93_vs_42 <- lfcShrink(dds, contrast=c("condition", "p93", "42"), type='ashr')
+    write.csv(p93_vs_42,paste0("output/",neuron_type,"_p93_vs_42",".csv"),row.names=TRUE)
+    genes_to <- rownames(head(arrange(as.data.frame(p93_vs_42), padj, desc(log2FoldChange)),n=10))
+    plotMA_label(p93_vs_42, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_p93_vs_42_MA",".pdf"))
+    plot_volcano_label(p93_vs_42, genes_to_label=genes_to)
+    ggsave(paste0("output/",neuron_type,"_p93_vs_42_volcano",".pdf"))
+
+    results_list <- c(p93_vs_wt, v42_vs_wt, empty_vs_wt, p93_vs_empty, v42_vs_empty, p93_vs_42)
+    
+    return(results_list)
+
+}
+```
+
+```{r run_foreach}
+dds_list <- foreach(neuron_type = neuron_types_to_track) %dopar%{
+ 
+    get_dds_list(neuron_type)
+}
+
+
+```
+
+```{r heatmap}
+plot_heatmap <- function(rld, colData, cols_for_grouping){
+    sampleDists <- dist(t(assay(rld)))
+    sampleDistMatrix <- as.matrix(sampleDists)
+    rownames(sampleDistMatrix) <- colnames(rld)
+    colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'RdBu')))(255)
+    df <- as.data.frame(colData(rld)[, cols_for_grouping])
+    colnames(df) <- cols_for_grouping
+    rownames(df) <- colnames(rld)
+    heatmaply::heatmaply(sampleDistMatrix,
+              scale='none',
+              col=colors,
+              row_side_colors=df,
+              fontsize_col = 8,
+              showticklabels=c(FALSE,TRUE))
+}
+
+    cols_for_grouping <- c("condition", "batch")
+    samples <- counts(dds, normalized=TRUE)[shared_genes,]
+    samples <- t(apply(samples, 1, scale))
+    sampleMatrix <- as.data.frame(samples)
+    colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'RdBu')))(255)
+    df <- as.data.frame(colData(dds)[, cols_for_grouping])
+    colnames(df) <- cols_for_grouping
+    rownames(df) <- colnames(dds)
+    heatmaply::heatmaply(t(sampleMatrix),
+              scale='none',
+              col=colors,
+              row_side_colors=df,
+              fontsize_Col = 8,
+              file = 'microglia_rlog_corrected_gene_expression.html',
+              showticklabels=c(FALSE,TRUE))
+```
