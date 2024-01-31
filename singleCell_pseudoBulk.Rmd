@@ -32,20 +32,10 @@ options(future.globals.maxSize = 8000 * 1024^2)
 plan()
 ```
 
-```{r test, eval=FALSE}
-# get data
-# From this stuff we can see that previous clustering is critical
-eh <- ExperimentHub()
-query(eh, "Kang")
-
-sce <- eh[["EH2259"]]
-seu.obj <- as.Seurat(sce, data = NULL)
-```
-
-```{r get_data, cache=TRUE, eval=FALSE}
+```{r get_data, eval=TRUE}
 # get data
 base_dir <- "/data/CARD_singlecell/ANXA11_AS/220201_A00941_0768_AHTTVTDRXY/220201_A00941_0768_AHTTVTDRXY/Data/Chromium_20220525/"
-,
+
 create_obj <- function(base_dir, folder) {
     # base_dir_full <- paste0(base_dir, folder, '/outs/raw_feature_bc_matrix')
     base_dir_full <- paste0(base_dir, folder, '/outs/filtered_feature_bc_matrix')
@@ -105,7 +95,7 @@ merged_seurat <- merge(x = obj_2_i40,
 # QC and filtering
 # explore QC
 
-```{r other, results='asis', eval=FALSE}
+```{r other, results='asis', eval=TRUE}
 # novelty score
 merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
 
@@ -170,7 +160,7 @@ save(filtered_seurat, file="seurat_filtered.RData")
 ```
 
 
-```{r rest, eval=FALSE}
+```{r rest, eval=TRUE}
 load("seurat_filtered.RData")
 seu.filtered <- filtered_seurat
 
@@ -215,6 +205,11 @@ seurat_clustered <- FindClusters(seu.filtered,
 seu.filtered <- seurat_clustered
 pdf("cluster_plot_batch.pdf")
 # show the batch effect on the clustering
+DimPlot(seurat_clustered, reduction="umap", raster=TRUE, raster.dpi=c(600,600))
+dev.off()
+
+pdf("cluster_plot.pdf")
+# show the batch effect on the clustering
 DimPlot(seurat_clustered, reduction="umap", group.by="batch", raster=TRUE, raster.dpi=c(600,600))
 dev.off()
 
@@ -253,7 +248,7 @@ dev.off()
 #cell.combined <- FindClusters(cell.combined, resolution = 0.2)
 #
 
-DefaultAssay(cell.combined) <- "RNA"
+#DefaultAssay(cell.combined) <- "RNA"
 
 # cluster
 neurons <- c("MAP2", "TUBB3", "NEFL", "GRIN2B", "DCX", "SLC17A6", "SLC17A7")
@@ -903,11 +898,11 @@ get_dds_list <- function(neuron_type){
 }
 ```
 
-```{r run_foreach}
+```{r run_foreach_1}
 dds_list <- foreach(neuron_type = neuron_types_to_track) %dopar%{
  
     get_dds_list(neuron_type)
-}
+
 
     plot_volcano_label(v42_vs_empty, genes_to_label=genes_to)
     ggsave(paste0("output/",neuron_type,"_v42_vs_empty_volcano",".pdf"))
@@ -927,14 +922,6 @@ dds_list <- foreach(neuron_type = neuron_types_to_track) %dopar%{
 }
 ```
 
-```{r run_foreach}
-dds_list <- foreach(neuron_type = neuron_types_to_track) %dopar%{
- 
-    get_dds_list(neuron_type)
-}
-
-
-```
 
 ```{r heatmap}
 plot_heatmap <- function(rld, colData, cols_for_grouping){
